@@ -56,6 +56,68 @@ def get_voice_info(voice_code: str) -> dict:
     return AI_VOICES_CATALOG[0]
 
 
+def validate_and_analyze_prompt(prompt: str) -> dict:
+    """
+    Giả lập AI phân tích & duyệt Prompt:
+    1. Kiểm tra độ dài và ngữ nghĩa (tối thiểu 15 ký tự).
+    2. Tự động nhận diện chủ đề: cong-nghe, giao-thong, kinh-doanh, the-thao, tong-hop.
+    3. Tự động nhận diện phong cách tone: Vui vẻ, Trang trọng, Sôi nổi, Trầm ấm.
+    4. Gợi ý tên kênh radio phù hợp nếu người dùng chưa nhập hoặc muốn tham khảo.
+    """
+    clean_p = prompt.strip()
+    if len(clean_p) < 15:
+        return {
+            "valid": False,
+            "message": "Prompt quá ngắn hoặc chưa đủ thông tin. Vui lòng mô tả chi tiết hơn (tối thiểu 15 ký tự, ví dụ: 'Tạo kênh tin tức Esports cập nhật giải đấu LMHT, giọng vui vẻ...')."
+        }
+
+    p_lower = clean_p.lower()
+
+    # Nhận diện chủ đề
+    if any(k in p_lower for k in ["esports", "game", "gaming", "lmht", "bóng đá", "thể thao", "marathon", "vleague", "ngoại hạng"]):
+        topic = "the-thao"
+        topic_label = "Thể Thao & Esports"
+        default_name = "Radio Thể Thao & Esports 24/7"
+    elif any(k in p_lower for k in ["bác tài", "tài xế", "giao thông", "cao tốc", "ô tô", "xe máy", "đường phố", "ùn tắc", "thời tiết"]):
+        topic = "giao-thong"
+        topic_label = "Giao Thông & Đời Sống Bác Tài"
+        default_name = "Bản Tin Bác Tài & Nhịp Sống Cao Tốc"
+    elif any(k in p_lower for k in ["chứng khoán", "bất động sản", "nhà đất", "giá vàng", "tài chính", "đầu tư", "tiền tệ", "kinh doanh", "fdi", "ngân hàng"]):
+        topic = "kinh-doanh"
+        topic_label = "Tài Chính & Thị Trường Đầu Tư"
+        default_name = "Nhịp Đập Kinh Tế & Thị Trường Vàng"
+    elif any(k in p_lower for k in ["ai", "trí tuệ nhân tạo", "công nghệ", "lập trình", "kỹ sư", "phần mềm", "bán dẫn", "startup", "code"]):
+        topic = "cong-nghe"
+        topic_label = "Công Nghệ & AI Số Hóa"
+        default_name = "Radio Công Nghệ & AI Khởi Nghiệp"
+    else:
+        topic = "tong-hop"
+        topic_label = "Thời Sự & Đời Sống Tổng Hợp"
+        default_name = "Điểm Tin Thời Sự & Đời Sống 24/7"
+
+    # Nhận diện phong cách tone
+    if any(k in p_lower for k in ["vui vẻ", "hài hước", "hóm hỉnh", "thân thiện", "gần gũi", "dí dỏm"]):
+        tone = "Vui vẻ"
+    elif any(k in p_lower for k in ["trang trọng", "chuyên sâu", "chuẩn mực", "phân tích", "chính thống", "nghiêm túc"]):
+        tone = "Trang trọng"
+    elif any(k in p_lower for k in ["sôi nổi", "năng lượng", "nhiệt huyết", "bùng nổ", "nhanh"]):
+        tone = "Sôi nổi"
+    elif any(k in p_lower for k in ["trầm ấm", "thư giãn", "nhẹ nhàng", "đêm muộn", "du dương", "bình yên"]):
+        tone = "Trầm ấm"
+    else:
+        tone = "Vui vẻ" if topic in ["giao-thong", "the-thao"] else ("Sôi nổi" if topic == "cong-nghe" else "Trang trọng")
+
+    return {
+        "valid": True,
+        "message": "Prompt hợp lệ! AI đã phân tích và trích xuất ngữ cảnh thành công.",
+        "inferred_topic": topic,
+        "topic_label": topic_label,
+        "inferred_tone": tone,
+        "suggested_title": default_name,
+        "summary": f"Kênh tập trung vào '{topic_label}', phong cách dẫn '{tone}'"
+    }
+
+
 def generate_host_intro(voice: dict, tone: str, topic: str, channel_name: str, prompt: str) -> str:
     """Tạo lời chào mở đầu của MC radio dựa theo phong cách và đối tượng thính giả."""
     mc_name = voice["name"]

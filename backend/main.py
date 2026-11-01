@@ -4,17 +4,48 @@ Cung cấp RESTful API cho xác thực, quản lý kênh, kiểm tra Whitelist, 
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional
+
+backend_dir = Path(__file__).resolve().parent
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
 from fastapi import FastAPI, HTTPException, Depends, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from dotenv import load_dotenv
+
+# Tìm và nạp file .env từ cả thư mục backend/ lẫn thư mục gốc dự án
+env_paths = [
+    Path(__file__).resolve().parent / ".env",
+    Path(__file__).resolve().parent.parent / ".env"
+]
+for env_path in env_paths:
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, override=True)
+
+# 1. Đọc cả 2 biến môi trường từ file .env bằng python-dotenv
+# 2. Thay thế tất cả các đoạn hardcode tên model cũ bằng biến os.getenv("GEMINI_MODEL") (Mặc định 'gemini-1.5-flash')
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+
+# 3. Đảm bảo cấu hình timeout cho các request gọi Gemini API tối thiểu là 15 giây
+GEMINI_TIMEOUT = max(15, int(os.getenv("GEMINI_TIMEOUT", "15")))  # Cấu hình tối thiểu 15s
+
+
 import database
 import crawler
 import ai_editorial
+import gemini_service
+
+# Đồng bộ cấu hình model và timeout sang gemini_service
+gemini_service.GEMINI_MODEL = GEMINI_MODEL
+gemini_service.GEMINI_TIMEOUT = GEMINI_TIMEOUT
 
 # Khởi tạo cơ sở dữ liệu khi khởi động
 database.init_db()
@@ -81,6 +112,10 @@ class EditorialPreviewRequest(BaseModel):
     sources: List[str] = []
 
 
+class PromptValidationRequest(BaseModel):
+    prompt: str
+
+
 # ==========================================
 # AUTH ENDPOINTS
 # ==========================================
@@ -142,12 +177,16 @@ def get_current_user(user_id: int = Query(default=1)):
 # ==========================================
 
 @app.get("/api/sources/suggest")
-def get_suggested_sources(topic: str = Query(default="cong-nghe")):
-    """Lấy danh sách các trang báo gợi ý theo chủ đề và kiểm tra Whitelist sẵn."""
-    sources = crawler.TOPIC_DEFAULT_SOURCES.get(topic, crawler.TOPIC_DEFAULT_SOURCES["cong-nghe"])
+def get_suggested_sources(topic: str = Query(default="cong-nghe"), prompt: str = Query(default="")):
+    """
+    Lấy danh sách các trang báo gợi ý theo chủ đề & prompt bằng Gemini AI,
+    tự động đề xuất 5-8 nguồn báo chính thống và kiểm tra Whitelist sẵn.
+    """
+    sources = gemini_service.suggest_sources_with_gemini(topic, prompt)
     enriched = []
     for s in sources:
-        check = crawler.check_domain_whitelist(s["domain"])
+        domain = s.get("domain", "")
+        check = crawler.check_domain_whitelist(domain)
         enriched.append({
             **s,
             "whitelist_info": check
@@ -171,34 +210,48 @@ def get_voices():
     return {"voices": ai_editorial.AI_VOICES_CATALOG}
 
 
+@app.post("/api/ai/validate-prompt")
+def validate_prompt(req: PromptValidationRequest):
+    """
+    Phân tích ngữ nghĩa Semantic Analysis & duyệt Prompt bằng Google Gemini API.
+    Loại bỏ hoàn toàn các đoạn code if/else hardcode.
+    """
+    return gemini_service.validate_prompt_with_gemini(req.prompt)
+
+
 # ==========================================
-# AI EDITORIAL PREVIEW (WIZARD BƯỚC 4)
+# AI EDITORIAL PREVIEW (WIZARD BƯỚC 4 & API GENERATE-SCRIPT)
 # ==========================================
 
-@app.post("/api/ai/editorial-preview")
-def preview_ai_editorial(req: EditorialPreviewRequest):
+def _generate_editorial_script_helper(req: EditorialPreviewRequest):
     """
-    Mô phỏng Pipeline AI Editorial:
-    1. Cào tóm tắt tin tức từ các nguồn đã chọn.
-    2. Ghép kịch bản dẫn Radio có câu chào, lời chuyển đoạn (transition) và lời kết.
+    Hàm lõi sinh kịch bản phát thanh AI chuyên nghiệp bằng Gemini:
+    - Thu thập tin tức thời gian thực từ các nguồn được chọn.
+    - Mở rộng độ dài kịch bản từ 400 - 600 từ với đầy đủ 4 phần:
+      1. Lời chào & Giới thiệu kênh độc đáo từ MC (với Station ID & SFX).
+      2. Lời dẫn chuyển đoạn (Transitions) mượt mà.
+      3. 3-4 tin tức nổi bật phân tích chuyên sâu, đa chiều.
+      4. Lời kết dặn dò thính giả & Outro.
     """
-    # 1. Cào tin tức
+    # 1. Thu thập tin tức liên quan từ nguồn báo
     news_items = crawler.crawl_news_from_sources(
         sources_list=req.sources if req.sources else [req.topic],
         topic=req.topic,
         prompt=req.prompt,
-        max_total_items=3
+        max_total_items=4
     )
 
-    # 2. Biên tập kịch bản phát thanh AI
-    editorial_result = ai_editorial.build_editorial_radio_script(
+    voice_info = ai_editorial.get_voice_info(req.voice_code)
+
+    # 2. Biên tập kịch bản phát thanh AI chuyên sâu bằng Gemini
+    editorial_result = gemini_service.generate_deep_editorial_script(
         channel_name=req.name,
         prompt=req.prompt,
         topic=req.topic,
         tone=req.tone,
-        voice_code=req.voice_code,
-        content_type=req.content_type,
-        news_items=news_items
+        voice_info=voice_info,
+        sources=req.sources,
+        crawled_news=news_items
     )
 
     return {
@@ -206,6 +259,18 @@ def preview_ai_editorial(req: EditorialPreviewRequest):
         "preview": editorial_result,
         "crawled_news": news_items
     }
+
+
+@app.post("/api/ai/editorial-preview")
+def preview_ai_editorial(req: EditorialPreviewRequest):
+    """Endpoint biên tập kịch bản cho Wizard Bước 4."""
+    return _generate_editorial_script_helper(req)
+
+
+@app.post("/api/generate-script")
+def generate_script_api(req: EditorialPreviewRequest):
+    """Endpoint chuẩn /api/generate-script theo yêu cầu kỹ thuật."""
+    return _generate_editorial_script_helper(req)
 
 
 # ==========================================
@@ -245,18 +310,20 @@ def create_channel(req: ChannelCreateRequest):
         sources_list=req.sources if req.sources else [req.topic],
         topic=req.topic,
         prompt=req.prompt,
-        max_total_items=3
+        max_total_items=4
     )
 
-    # Sinh kịch bản số phát sóng đầu tiên
-    editorial_result = ai_editorial.build_editorial_radio_script(
+    voice_info = ai_editorial.get_voice_info(req.voice_code)
+
+    # Sinh kịch bản số phát sóng đầu tiên sâu sắc, dài dặn (400-600 từ) bằng Gemini
+    editorial_result = gemini_service.generate_deep_editorial_script(
         channel_name=req.name,
         prompt=req.prompt,
         topic=req.topic,
         tone=req.tone,
-        voice_code=req.voice_code,
-        content_type=req.content_type,
-        news_items=news_items
+        voice_info=voice_info,
+        sources=req.sources,
+        crawled_news=news_items
     )
 
     # Lưu bản tin vào DB
@@ -301,7 +368,7 @@ def delete_channel(channel_id: int, user_id: int = Query(default=1)):
 
 @app.post("/api/channels/{channel_id}/generate-broadcast")
 def generate_fresh_broadcast(channel_id: int):
-    """Làm mới bản tin cho kênh: Cào lại tin tức thời gian thực và sinh kịch bản phát sóng mới."""
+    """Làm mới bản tin cho kênh: Cào lại tin tức thời gian thực và sinh kịch bản phát sóng mới bằng Gemini."""
     channel = database.get_channel_by_id(channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Kênh không tồn tại.")
@@ -310,17 +377,19 @@ def generate_fresh_broadcast(channel_id: int):
         sources_list=channel.get("sources", []),
         topic=channel.get("topic", "cong-nghe"),
         prompt=channel.get("prompt", ""),
-        max_total_items=3
+        max_total_items=4
     )
 
-    editorial_result = ai_editorial.build_editorial_radio_script(
+    voice_info = ai_editorial.get_voice_info(channel.get("voice_code", "vi-VN-MinhQuan"))
+
+    editorial_result = gemini_service.generate_deep_editorial_script(
         channel_name=channel["name"],
         prompt=channel["prompt"],
         topic=channel["topic"],
         tone=channel["tone"],
-        voice_code=channel["voice_code"],
-        content_type=channel["content_type"],
-        news_items=news_items
+        voice_info=voice_info,
+        sources=channel.get("sources", []),
+        crawled_news=news_items
     )
 
     broadcast = database.create_broadcast(
@@ -333,19 +402,23 @@ def generate_fresh_broadcast(channel_id: int):
 
     return {
         "success": True,
-        "message": "Đã cập nhật bản tin phát thanh trực tiếp mới nhất!",
+        "message": "Đã cập nhật bản tin phát thanh trực tiếp mới nhất bằng Gemini AI!",
         "broadcast": broadcast
     }
 
 
 @app.get("/api/health")
 def health_check():
-    """Kiểm tra tình trạng hoạt động của hệ thống."""
+    """Kiểm tra tình trạng hoạt động của hệ thống và kết nối Gemini API."""
+    current_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     return {
         "status": "healthy",
         "service": "Radio VN AI Studio API",
+        "gemini_model": current_model,
+        "gemini_timeout_sec": GEMINI_TIMEOUT,
         "database": "SQLite Connected",
-        "crawler": "Ready"
+        "crawler": "Ready",
+        "gemini_ai": f"Connected (Active - Model: {current_model}, Timeout: {GEMINI_TIMEOUT}s)" if gemini_service.is_gemini_configured() else "Fallback Engine (Set GEMINI_API_KEY in .env)"
     }
 
 
